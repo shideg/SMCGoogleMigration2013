@@ -1,0 +1,256 @@
+#!/usr/bin/perl -w
+
+#--------------------------------------------------------------------\
+# googleAppify
+#
+# Provision specified accounts for Google Apps.
+#
+# Create googleApps account.
+# Put them in the correct OU on Google.
+# Make them a member of the google group corresponding to the OU
+# Make them members of CN=GoogleAppsUsers,OU=SecondaryUserGroups,OU=Groups,DC=saintmarys,DC=edu 
+#
+# Written by Steve HIdeg <hideg@saintmarys.edu>
+#
+# December 2012
+#
+# Copyright (C) 2013  Steve Hideg
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see file GPL.txt); if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#--------------------------------------------------------------------/
+
+use strict;
+
+print <<END_OF_GPL_DISCLAIMER;
+
+googleAppify version 1, Copyright (C) 2013 Steve Hideg
+googleAppify comes with ABSOLUTELY NO WARRANTY.
+This is free software, and you are welcome to redistribute it
+under certain conditions. See file GPL.txt.
+
+END_OF_GPL_DISCLAIMER
+
+# BE SURE TO ADJUST PATHS TO THESE FOR YOUR OWN ENVIRONMENT
+require 'adUtils.pl';
+require 'ldapUtils.pl';
+require 'miscUtils.pl';
+require 'googleUtils.pl';
+
+
+if($#ARGV == -1)
+	{
+
+
+	print "Usage: googleAppify username\n";
+	print "Or specify one username per line. End with ctrl-D:\n";
+	# This will work manually or with input redirection from a file with <
+	# e.g. googleAppify < data.txt
+	while(<STDIN>)
+		{
+		chomp;
+		# skip commented lines (first non-space character is a #)
+		next if($_ =~ /^\s*#/);
+		# skip blank lines
+		next if($_ eq '');
+		# read a simple list of usernames, one per line
+		# or read the GAMME csv control files
+		# by ignoring everything after the first @ character on each line
+		$_ =~ /([\w|-]+)@?.*/;
+		push @ARGV,$1;
+		}
+	}
+
+
+
+# run time stamp
+my ($runSec,$runMin,$runHour,$runDay,$runMonth,$runYear) = (localtime)[0,1,2,3,4,5];
+my $runTimeStamp = sprintf("%4d%02d%02d%02d%02d%02d",$runYear+1900,$runMonth+1,$runDay,$runHour,$runMin,$runSec);
+
+my $gammeFileName = "gamme${runTimeStamp}.csv";
+
+open (GAMMEFILE, "> $gammeFileName") or
+	die "Unable to create $gammeFileName: $!\n";
+	
+print "Created output file $gammeFileName\n";
+
+
+
+my $adAdminldap = &AD_setupAdminLDAPS; 	# adUtils.pl
+my $adminldap = &setupLDAP; 			# ldapUtils.pl
+my $adBaseDN = 'ou=People,dc=saintmarys,dc=edu';
+my @adAttrs = qw(displayName givenname sn proxyAddresses);
+
+
+
+my $userCounter = 0;
+
+# arguments should all be usernames
+foreach my $u (@ARGV)
+	{
+	
+	# remove leading & trailing spaces
+	$u =~ s/^\s+//;
+	$u =~ s/\s+$//;
+	
+	# skip lines that are commented out (begin with #)
+	next if($u =~ /^\s*#/);
+	
+	$userCounter++;
+	print "\n$u\t($userCounter)\n";
+	
+	my $adFilter = "(cn=$u)";
+	my $adResult = AD_LDAPsearch($adAdminldap,$adFilter,\@adAttrs,$adBaseDN);
+
+	if($adResult->code)
+		{
+		print "  ", ldap_error_name($adResult->code),"\n";
+		print "  ", ldap_error_text($adResult->code),"\n";
+		}
+	elsif($adResult->count == 0)
+		{
+		print " User $u not found\n";
+		}
+	elsif($adResult->count > 1)
+		{
+		print $adResult->count, " entries for $u found!\n";
+		}
+	else
+		{
+
+		# Gather user data
+		
+		my $entry = $adResult->entry(0);
+		my $dn = $entry->dn;
+
+		if(dnIsGoogleAppsUserMember($adAdminldap,$dn))
+			{
+			print " Already a GoogleApps user\n";
+			next;
+			}
+
+		print " DN: $dn\n";
+
+		my $ou = parseOU($dn); # googleUtils.pl
+		print " OU: $ou\n";
+		# if OU is invalid, we skip processing this one
+		if ($ou =~ /INVALID OU/)
+			{
+			print " CANNOT PROCESS $u\n";
+			next;
+			}
+
+		my $displayName = $entry->get_value('displayName') ?  $entry->get_value('displayName') : 'NONE';
+		print " DisplayName: $displayName\n";
+		my $givenname = $entry->get_value('givenname') ?  $entry->get_value('givenname') : 'NONE';
+		print " givenname: $givenname\n";
+		my $sn = $entry->get_value('sn') ?  $entry->get_value('sn') : 'NONE';
+		print " sn: $sn\n";
+		if(($givenname eq 'NONE') || ($sn eq 'NONE'))
+			{
+			print " CANNOT PROCESS $u. sn and givenname must be set in AD.\n";
+			next;
+			}
+
+		# get the user's password
+		my $cypheredPW = ldap_getCypheredPassword($adminldap,$u); # ldapUtils.pl
+		if($cypheredPW eq 'UNKNOWN')
+			{
+			print " CANNOT PROCESS $u - password not known\n";
+			next;
+			}
+		my $pw = cypherString($cypheredPW); # miscUtils.pl
+
+
+		# get any email aliases set up for this user
+		my @aliases = getEmailAliases($entry);
+		if(scalar(@aliases))
+			{
+			print " Aliases:\n";
+			foreach my $a (@aliases)
+				{
+				print "  $a\n";
+				}
+			}
+
+		my $error;
+
+		# create googleApps account and place it in the correct OU
+		print "\n Creating GoogleApps Account\n";
+		$error = google_createGoogleAppsAccount($u,$pw,$givenname,$sn,$ou); # googleUtils.pl
+		
+		mySleep(4);
+		
+		# enable IMAP for account
+		print "\n Enabling IMAP\n";
+		$error = google_enableIMAP($u); # googleUtils.pl
+
+		mySleep(1);
+		
+		# turn off web clips
+		print "\n Disabling Web Clips\n";
+		$error = google_disableWebClips($u); # googleUtils.pl
+		
+		mySleep(1);
+		
+		# add user to the group corresponding to their OU
+		print "\n Adding to group for $ou\n";
+		$error = google_addToGroupByOU($u,$ou); # googleUtils.pl
+		
+		# add aliases for user, if any
+		if(scalar(@aliases))
+			{
+			print "\n Adding aliases\n";
+			foreach my $a (@aliases)
+				{
+				mySleep(1);
+				$error = google_createAliasForUser($u,$a); # googleUtils.pl
+				}
+			}
+				
+		# make the account a member of the GoogleAppsUsers AD group
+		print "\n Adding to GoogleAppsUsers group in Active Directory\n";
+		$error = addDNtoGoogleAppsUsers($adAdminldap,$dn); # adUtils.pl
+		
+		# Output a line to text file for controlling GAMME and other processes
+		# See Page 24 of http://static.googleusercontent.com/external_content/untrusted_dlcp/www.google.com/en/us/support/enterprise/static/gapps/docs/admin/en/gapps_exchange_migration/gamme_admin.pdf
+		# Use the local Zimbra password so we aren't storing AD passwords in the clear
+		print GAMMEFILE "$u\@saintmarys.edu#LOCALZIMBRAPASSOWORD $u\@saintmarys.edu\n";
+		
+
+		
+		} # else, if($adResult->code)
+	}	
+
+$adAdminldap->unbind;
+$adminldap->unbind;
+close GAMMEFILE;
+
+print "\n$userCounter accounts processed.\n";
+
+print "\nBe sure to adjust line-endings in $gammeFileName before transporting to the gmpr Windows machine.\n";
+
+
+
+
+sub mySleep {
+
+my $sec = shift;
+
+print " Sleep $sec...";
+sleep $sec;
+print "\n";
+
+} # sub mySleep
